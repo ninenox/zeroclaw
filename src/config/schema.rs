@@ -216,6 +216,10 @@ pub struct Config {
     #[serde(default)]
     pub web_search: WebSearchConfig,
 
+    /// Project delivery intelligence configuration (`[project_intel]`).
+    #[serde(default)]
+    pub project_intel: ProjectIntelConfig,
+
     /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]`).
     #[serde(default)]
     pub proxy: ProxyConfig,
@@ -1781,6 +1785,52 @@ impl Default for WebSearchConfig {
             brave_api_key: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
+        }
+    }
+}
+
+// ── Project Intelligence ────────────────────────────────────────
+
+/// Project delivery intelligence configuration (`[project_intel]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProjectIntelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_project_intel_language")]
+    pub default_language: String,
+    #[serde(default = "default_project_intel_report_dir")]
+    pub report_output_dir: String,
+    #[serde(default)]
+    pub templates_dir: Option<String>,
+    #[serde(default = "default_project_intel_risk_sensitivity")]
+    pub risk_sensitivity: String,
+    #[serde(default = "default_true")]
+    pub include_git_data: bool,
+    #[serde(default)]
+    pub include_jira_data: bool,
+    #[serde(default)]
+    pub jira_base_url: Option<String>,
+}
+fn default_project_intel_language() -> String {
+    "en".into()
+}
+fn default_project_intel_report_dir() -> String {
+    "~/.zeroclaw/project-reports".into()
+}
+fn default_project_intel_risk_sensitivity() -> String {
+    "medium".into()
+}
+impl Default for ProjectIntelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_language: default_project_intel_language(),
+            report_output_dir: default_project_intel_report_dir(),
+            templates_dir: None,
+            risk_sensitivity: default_project_intel_risk_sensitivity(),
+            include_git_data: true,
+            include_jira_data: false,
+            jira_base_url: None,
         }
     }
 }
@@ -4697,6 +4747,7 @@ impl Default for Config {
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
+            project_intel: ProjectIntelConfig::default(),
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
@@ -5854,6 +5905,26 @@ impl Config {
             validate_mcp_config(&self.mcp)?;
         }
 
+        // Project intelligence
+        if self.project_intel.enabled {
+            let lang = &self.project_intel.default_language;
+            if !["en", "de", "fr", "it"].contains(&lang.as_str()) {
+                anyhow::bail!(
+                    "project_intel.default_language must be one of: en, de, fr, it (got '{lang}')"
+                );
+            }
+            let sens = &self.project_intel.risk_sensitivity;
+            if !["low", "medium", "high"].contains(&sens.as_str()) {
+                anyhow::bail!("project_intel.risk_sensitivity must be one of: low, medium, high (got '{sens}')");
+            }
+            if let Some(ref tpl_dir) = self.project_intel.templates_dir {
+                let path = std::path::Path::new(tpl_dir);
+                if !path.exists() {
+                    anyhow::bail!("project_intel.templates_dir path does not exist: {tpl_dir}");
+                }
+            }
+        }
+
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
 
@@ -6642,6 +6713,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     #[cfg(unix)]
+    #[allow(unused_imports)]
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
@@ -6966,6 +7038,7 @@ default_temperature = 0.7
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
+            project_intel: ProjectIntelConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
@@ -7262,6 +7335,7 @@ tool_dispatcher = "xml"
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
+            project_intel: ProjectIntelConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
