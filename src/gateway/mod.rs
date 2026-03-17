@@ -746,8 +746,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         session_backend,
         device_registry,
         pending_pairings,
-        control_plane,
+        control_plane: control_plane.clone(),
     };
+
+    // Spawn control plane health monitor if enabled
+    if let Some(ref cp) = control_plane {
+        let cp_clone = Arc::clone(cp);
+        tokio::spawn(async move {
+            cp_clone.health_monitor(30).await;
+        });
+    }
 
     // Config PUT needs larger body limit (1MB)
     let config_put_router = Router::new()
