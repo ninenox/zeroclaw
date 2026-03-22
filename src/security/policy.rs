@@ -116,6 +116,7 @@ fn default_allowed_commands() -> Vec<String> {
         "du".into(),
         "uname".into(),
         "uptime".into(),
+        #[cfg(target_os = "linux")]
         "free".into(),
         "hostname".into(),
     ]
