@@ -357,6 +357,10 @@ pub struct Config {
     #[serde(default)]
     pub linkedin: LinkedInConfig,
 
+    /// Standalone image generation tool configuration (`[image_gen]`).
+    #[serde(default)]
+    pub image_gen: ImageGenConfig,
+
     /// Plugin system configuration (`[plugins]`).
     #[serde(default)]
     pub plugins: PluginsConfig,
@@ -2974,6 +2978,46 @@ impl Default for ImageProviderFluxConfig {
     }
 }
 
+// ── Standalone Image Generation ─────────────────────────────────
+
+/// Standalone image generation tool configuration (`[image_gen]`).
+///
+/// When enabled, registers an `image_gen` tool that generates images via
+/// fal.ai's synchronous API (Flux / Nano Banana models) and saves them
+/// to the workspace `images/` directory.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ImageGenConfig {
+    /// Enable the standalone image generation tool. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Default fal.ai model identifier.
+    #[serde(default = "default_image_gen_model")]
+    pub default_model: String,
+
+    /// Environment variable name holding the fal.ai API key.
+    #[serde(default = "default_image_gen_api_key_env")]
+    pub api_key_env: String,
+}
+
+fn default_image_gen_model() -> String {
+    "fal-ai/flux/schnell".into()
+}
+
+fn default_image_gen_api_key_env() -> String {
+    "FAL_API_KEY".into()
+}
+
+impl Default for ImageGenConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_model: default_image_gen_model(),
+            api_key_env: default_image_gen_api_key_env(),
+        }
+    }
+}
+
 // ── Claude Code ─────────────────────────────────────────────────
 
 /// Claude Code CLI tool configuration (`[claude_code]` section).
@@ -4878,6 +4922,8 @@ pub struct ChannelsConfig {
     pub telegram: Option<TelegramConfig>,
     /// Discord bot channel configuration.
     pub discord: Option<DiscordConfig>,
+    /// Discord history channel — logs ALL messages and forwards @mentions to agent.
+    pub discord_history: Option<DiscordHistoryConfig>,
     /// Slack bot channel configuration.
     pub slack: Option<SlackConfig>,
     /// Mattermost bot channel configuration.
@@ -4900,6 +4946,8 @@ pub struct ChannelsConfig {
     pub nextcloud_talk: Option<NextcloudTalkConfig>,
     /// Email channel configuration.
     pub email: Option<crate::channels::email_channel::EmailConfig>,
+    /// Gmail Pub/Sub push notification channel configuration.
+    pub gmail_push: Option<crate::channels::gmail_push::GmailPushConfig>,
     /// IRC channel configuration.
     pub irc: Option<IrcConfig>,
     /// Lark channel configuration.
@@ -4924,6 +4972,9 @@ pub struct ChannelsConfig {
     pub reddit: Option<RedditConfig>,
     /// Bluesky channel configuration (AT Protocol).
     pub bluesky: Option<BlueskyConfig>,
+    /// Voice wake word detection channel configuration.
+    #[cfg(feature = "voice-wake")]
+    pub voice_wake: Option<VoiceWakeConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -5007,6 +5058,10 @@ impl ChannelsConfig {
                 self.email.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.gmail_push.as_ref())),
+                self.gmail_push.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.irc.as_ref())),
                 self.irc.is_some()
             ),
@@ -5047,6 +5102,11 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.bluesky.as_ref())),
                 self.bluesky.is_some(),
             ),
+            #[cfg(feature = "voice-wake")]
+            (
+                Box::new(ConfigWrapper::new(self.voice_wake.as_ref())),
+                self.voice_wake.is_some(),
+            ),
         ]
     }
 
@@ -5074,6 +5134,7 @@ impl Default for ChannelsConfig {
             cli: true,
             telegram: None,
             discord: None,
+            discord_history: None,
             slack: None,
             mattermost: None,
             webhook: None,
@@ -5085,6 +5146,7 @@ impl Default for ChannelsConfig {
             wati: None,
             nextcloud_talk: None,
             email: None,
+            gmail_push: None,
             irc: None,
             lark: None,
             feishu: None,
@@ -5098,6 +5160,8 @@ impl Default for ChannelsConfig {
             clawdtalk: None,
             reddit: None,
             bluesky: None,
+            #[cfg(feature = "voice-wake")]
+            voice_wake: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
             show_tool_calls: false,
@@ -5198,6 +5262,39 @@ impl ChannelConfig for DiscordConfig {
     }
     fn desc() -> &'static str {
         "connect your bot"
+    }
+}
+
+/// Discord history channel — logs ALL messages to discord.db and forwards @mentions to the agent.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DiscordHistoryConfig {
+    /// Discord bot token (from Discord Developer Portal).
+    pub bot_token: String,
+    /// Optional guild (server) ID to restrict logging to a single guild.
+    pub guild_id: Option<String>,
+    /// Allowed Discord user IDs. Empty = allow all (open logging).
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Discord channel IDs to watch. Empty = watch all channels.
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
+    /// When true (default), store Direct Messages in discord.db.
+    #[serde(default = "default_true")]
+    pub store_dms: bool,
+    /// When true (default), respond to @mentions in Direct Messages.
+    #[serde(default = "default_true")]
+    pub respond_to_dms: bool,
+    /// Per-channel proxy URL (http, https, socks5, socks5h).
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+}
+
+impl ChannelConfig for DiscordHistoryConfig {
+    fn name() -> &'static str {
+        "Discord History"
+    }
+    fn desc() -> &'static str {
+        "log all messages and forward @mentions"
     }
 }
 
@@ -6349,6 +6446,74 @@ impl ChannelConfig for BlueskyConfig {
     }
 }
 
+/// Voice wake word detection channel configuration.
+///
+/// Listens on the default microphone for a configurable wake word,
+/// then captures the following utterance and transcribes it via the
+/// existing transcription API.
+#[cfg(feature = "voice-wake")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VoiceWakeConfig {
+    /// Wake word phrase to listen for (case-insensitive substring match).
+    /// Default: `"hey zeroclaw"`.
+    #[serde(default = "default_voice_wake_word")]
+    pub wake_word: String,
+    /// Silence timeout in milliseconds — how long to wait after the last
+    /// energy spike before finalizing a capture window. Default: `2000`.
+    #[serde(default = "default_voice_wake_silence_timeout_ms")]
+    pub silence_timeout_ms: u32,
+    /// RMS energy threshold for voice activity detection. Samples below
+    /// this level are treated as silence. Default: `0.01`.
+    #[serde(default = "default_voice_wake_energy_threshold")]
+    pub energy_threshold: f32,
+    /// Maximum capture duration in seconds before forcing transcription.
+    /// Default: `30`.
+    #[serde(default = "default_voice_wake_max_capture_secs")]
+    pub max_capture_secs: u32,
+}
+
+#[cfg(feature = "voice-wake")]
+fn default_voice_wake_word() -> String {
+    "hey zeroclaw".into()
+}
+
+#[cfg(feature = "voice-wake")]
+fn default_voice_wake_silence_timeout_ms() -> u32 {
+    2000
+}
+
+#[cfg(feature = "voice-wake")]
+fn default_voice_wake_energy_threshold() -> f32 {
+    0.01
+}
+
+#[cfg(feature = "voice-wake")]
+fn default_voice_wake_max_capture_secs() -> u32 {
+    30
+}
+
+#[cfg(feature = "voice-wake")]
+impl Default for VoiceWakeConfig {
+    fn default() -> Self {
+        Self {
+            wake_word: default_voice_wake_word(),
+            silence_timeout_ms: default_voice_wake_silence_timeout_ms(),
+            energy_threshold: default_voice_wake_energy_threshold(),
+            max_capture_secs: default_voice_wake_max_capture_secs(),
+        }
+    }
+}
+
+#[cfg(feature = "voice-wake")]
+impl ChannelConfig for VoiceWakeConfig {
+    fn name() -> &'static str {
+        "VoiceWake"
+    }
+    fn desc() -> &'static str {
+        "voice wake word detection"
+    }
+}
+
 /// Nostr channel configuration (NIP-04 + NIP-17 private messages)
 #[cfg(feature = "channel-nostr")]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -6822,6 +6987,7 @@ impl Default for Config {
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
+            image_gen: ImageGenConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
@@ -7616,6 +7782,13 @@ impl Config {
                     &store,
                     &mut em.password,
                     "config.channels_config.email.password",
+                )?;
+            }
+            if let Some(ref mut gp) = config.channels_config.gmail_push {
+                decrypt_secret(
+                    &store,
+                    &mut gp.oauth_token,
+                    "config.channels_config.gmail_push.oauth_token",
                 )?;
             }
             if let Some(ref mut irc) = config.channels_config.irc {
@@ -9049,6 +9222,13 @@ impl Config {
                 "config.channels_config.email.password",
             )?;
         }
+        if let Some(ref mut gp) = config_to_save.channels_config.gmail_push {
+            encrypt_secret(
+                &store,
+                &mut gp.oauth_token,
+                "config.channels_config.gmail_push.oauth_token",
+            )?;
+        }
         if let Some(ref mut irc) = config_to_save.channels_config.irc {
             encrypt_optional_secret(
                 &store,
@@ -9286,7 +9466,6 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex as StdMutex};
-    #[cfg(unix)]
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
@@ -9677,6 +9856,7 @@ default_temperature = 0.7
                     proxy_url: None,
                 }),
                 discord: None,
+                discord_history: None,
                 slack: None,
                 mattermost: None,
                 webhook: None,
@@ -9688,6 +9868,7 @@ default_temperature = 0.7
                 wati: None,
                 nextcloud_talk: None,
                 email: None,
+                gmail_push: None,
                 irc: None,
                 lark: None,
                 feishu: None,
@@ -9701,6 +9882,8 @@ default_temperature = 0.7
                 clawdtalk: None,
                 reddit: None,
                 bluesky: None,
+                #[cfg(feature = "voice-wake")]
+                voice_wake: None,
                 message_timeout_secs: 300,
                 ack_reactions: true,
                 show_tool_calls: true,
@@ -9745,6 +9928,7 @@ default_temperature = 0.7
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
+            image_gen: ImageGenConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
@@ -10126,6 +10310,7 @@ default_temperature = 0.7
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
+            image_gen: ImageGenConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
@@ -10512,6 +10697,7 @@ allowed_users = ["@ops:matrix.org"]
             cli: true,
             telegram: None,
             discord: None,
+            discord_history: None,
             slack: None,
             mattermost: None,
             webhook: None,
@@ -10533,6 +10719,7 @@ allowed_users = ["@ops:matrix.org"]
             wati: None,
             nextcloud_talk: None,
             email: None,
+            gmail_push: None,
             irc: None,
             lark: None,
             feishu: None,
@@ -10545,6 +10732,8 @@ allowed_users = ["@ops:matrix.org"]
             clawdtalk: None,
             reddit: None,
             bluesky: None,
+            #[cfg(feature = "voice-wake")]
+            voice_wake: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
@@ -10827,6 +11016,7 @@ channel_id = "C123"
             cli: true,
             telegram: None,
             discord: None,
+            discord_history: None,
             slack: None,
             mattermost: None,
             webhook: None,
@@ -10852,6 +11042,7 @@ channel_id = "C123"
             wati: None,
             nextcloud_talk: None,
             email: None,
+            gmail_push: None,
             irc: None,
             lark: None,
             feishu: None,
@@ -10864,6 +11055,8 @@ channel_id = "C123"
             clawdtalk: None,
             reddit: None,
             bluesky: None,
+            #[cfg(feature = "voice-wake")]
+            voice_wake: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
@@ -13682,12 +13875,12 @@ require_otp_to_resume = true
     async fn ensure_bootstrap_files_creates_missing_files() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path().join("workspace");
-        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let _: () = tokio::fs::create_dir_all(&ws).await.unwrap();
 
         ensure_bootstrap_files(&ws).await.unwrap();
 
-        let soul = tokio::fs::read_to_string(ws.join("SOUL.md")).await.unwrap();
-        let identity = tokio::fs::read_to_string(ws.join("IDENTITY.md"))
+        let soul: String = tokio::fs::read_to_string(ws.join("SOUL.md")).await.unwrap();
+        let identity: String = tokio::fs::read_to_string(ws.join("IDENTITY.md"))
             .await
             .unwrap();
         assert!(soul.contains("SOUL.md"));
@@ -13698,21 +13891,21 @@ require_otp_to_resume = true
     async fn ensure_bootstrap_files_does_not_overwrite_existing() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path().join("workspace");
-        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let _: () = tokio::fs::create_dir_all(&ws).await.unwrap();
 
         let custom = "# My custom SOUL";
-        tokio::fs::write(ws.join("SOUL.md"), custom).await.unwrap();
+        let _: () = tokio::fs::write(ws.join("SOUL.md"), custom).await.unwrap();
 
         ensure_bootstrap_files(&ws).await.unwrap();
 
-        let soul = tokio::fs::read_to_string(ws.join("SOUL.md")).await.unwrap();
+        let soul: String = tokio::fs::read_to_string(ws.join("SOUL.md")).await.unwrap();
         assert_eq!(
             soul, custom,
             "ensure_bootstrap_files must not overwrite existing files"
         );
 
         // IDENTITY.md should still be created since it was missing
-        let identity = tokio::fs::read_to_string(ws.join("IDENTITY.md"))
+        let identity: String = tokio::fs::read_to_string(ws.join("IDENTITY.md"))
             .await
             .unwrap();
         assert!(identity.contains("IDENTITY.md"));

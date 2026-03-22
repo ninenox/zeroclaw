@@ -19,7 +19,9 @@ pub mod clawdtalk;
 pub mod cli;
 pub mod dingtalk;
 pub mod discord;
+pub mod discord_history;
 pub mod email_channel;
+pub mod gmail_push;
 pub mod imessage;
 pub mod irc;
 #[cfg(feature = "channel-lark")]
@@ -45,6 +47,8 @@ pub mod traits;
 pub mod transcription;
 pub mod tts;
 pub mod twitter;
+#[cfg(feature = "voice-wake")]
+pub mod voice_wake;
 pub mod wati;
 pub mod webhook;
 pub mod wecom;
@@ -59,7 +63,9 @@ pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
+pub use discord_history::DiscordHistoryChannel;
 pub use email_channel::EmailChannel;
+pub use gmail_push::GmailPushChannel;
 pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
 #[cfg(feature = "channel-lark")]
@@ -82,6 +88,8 @@ pub use traits::{Channel, SendMessage};
 #[allow(unused_imports)]
 pub use tts::{TtsManager, TtsProvider};
 pub use twitter::TwitterChannel;
+#[cfg(feature = "voice-wake")]
+pub use voice_wake::VoiceWakeChannel;
 pub use wati::WatiChannel;
 pub use webhook::WebhookChannel;
 pub use wecom::WeComChannel;
@@ -3775,6 +3783,31 @@ fn collect_configured_channels(
         });
     }
 
+    if let Some(ref dh) = config.channels_config.discord_history {
+        match crate::memory::SqliteMemory::new_named(&config.workspace_dir, "discord") {
+            Ok(discord_mem) => {
+                channels.push(ConfiguredChannel {
+                    display_name: "Discord History",
+                    channel: Arc::new(
+                        DiscordHistoryChannel::new(
+                            dh.bot_token.clone(),
+                            dh.guild_id.clone(),
+                            dh.allowed_users.clone(),
+                            dh.channel_ids.clone(),
+                            Arc::new(discord_mem),
+                            dh.store_dms,
+                            dh.respond_to_dms,
+                        )
+                        .with_proxy_url(dh.proxy_url.clone()),
+                    ),
+                });
+            }
+            Err(e) => {
+                tracing::error!("discord_history: failed to open discord.db: {e}");
+            }
+        }
+    }
+
     if let Some(ref sl) = config.channels_config.slack {
         channels.push(ConfiguredChannel {
             display_name: "Slack",
@@ -3966,6 +3999,15 @@ fn collect_configured_channels(
         });
     }
 
+    if let Some(ref gp_cfg) = config.channels_config.gmail_push {
+        if gp_cfg.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "Gmail Push",
+                channel: Arc::new(GmailPushChannel::new(gp_cfg.clone())),
+            });
+        }
+    }
+
     if let Some(ref irc) = config.channels_config.irc {
         channels.push(ConfiguredChannel {
             display_name: "IRC",
@@ -4142,6 +4184,17 @@ fn collect_configured_channels(
         });
     }
 
+    #[cfg(feature = "voice-wake")]
+    if let Some(ref vw) = config.channels_config.voice_wake {
+        channels.push(ConfiguredChannel {
+            display_name: "VoiceWake",
+            channel: Arc::new(VoiceWakeChannel::new(
+                vw.clone(),
+                config.transcription.clone(),
+            )),
+        });
+    }
+
     if let Some(ref wh) = config.channels_config.webhook {
         channels.push(ConfiguredChannel {
             display_name: "Webhook",
@@ -4292,22 +4345,22 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
-    let (mut built_tools, delegate_handle_ch): (Vec<Box<dyn Tool>>, _) =
-        tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
-            &security,
-            runtime,
-            Arc::clone(&mem),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &workspace,
-            &config.agents,
-            config.api_key.as_deref(),
-            &config,
-        );
+    let (mut built_tools, delegate_handle_ch, reaction_handle_ch) = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        Arc::clone(&mem),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &workspace,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+        None,
+    );
 
     // Wire MCP tools into the registry before freezing — non-fatal.
     // When `deferred_loading` is enabled, MCP tools are NOT added eagerly.
@@ -4581,6 +4634,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
+
+    // Populate the reaction tool's channel map now that channels are initialized.
+    if let Some(ref handle) = reaction_handle_ch {
+        let mut map = handle.write();
+        for (name, ch) in channels_by_name.as_ref() {
+            map.insert(name.clone(), Arc::clone(ch));
+        }
+    }
+
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
