@@ -12407,6 +12407,7 @@ default_model = "persisted-profile"
 
     #[test]
     async fn runtime_proxy_client_cache_reuses_default_profile_key() {
+        let _lock = env_override_lock().await;
         let service_key = format!(
             "provider.cache_test.{}",
             std::time::SystemTime::now()
@@ -12428,6 +12429,7 @@ default_model = "persisted-profile"
 
     #[test]
     async fn set_runtime_proxy_config_clears_runtime_proxy_client_cache() {
+        let _lock = env_override_lock().await;
         let service_key = format!(
             "provider.cache_timeout_test.{}",
             std::time::SystemTime::now()
