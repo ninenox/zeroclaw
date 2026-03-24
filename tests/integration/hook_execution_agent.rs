@@ -8,7 +8,7 @@ use zeroclaw::providers::traits::{ChatMessage, ChatResponse, TokenUsage};
 /// Test hook that counts llm_output fires
 struct LlmOutputCounter {
     count: Arc<AtomicUsize>,
-    last_model: Arc<parking_lot::Mutex<Option<String>>>,
+    _last_model: Arc<parking_lot::Mutex<Option<String>>>,
 }
 
 #[async_trait]
