@@ -36,6 +36,8 @@ pub use schema::{
     WorkspaceConfig, DEFAULT_GWS_SERVICES,
 };
 
+pub use traits::SecretFieldInfo;
+
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {
     (T::name(), channel.is_some())
 }
