@@ -9562,7 +9562,9 @@ impl Config {
                 if std::env::var(key).is_err() {
                     // SAFETY: called during single-threaded config load before
                     // any concurrent access to the environment.
-                    unsafe { std::env::set_var(key, value); }
+                    unsafe {
+                        std::env::set_var(key, value);
+                    }
                     tracing::debug!(key = %key, "Injected provider_env into process environment");
                 }
             }
