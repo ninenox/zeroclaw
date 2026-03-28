@@ -7188,7 +7188,9 @@ impl MqttConfig {
         }
 
         if is_tls_scheme && !self.use_tls {
-            anyhow::bail!("use_tls is false but broker_url uses 'mqtts://' (requires use_tls: true)");
+            anyhow::bail!(
+                "use_tls is false but broker_url uses 'mqtts://' (requires use_tls: true)"
+            );
         }
 
         // Topics validation
