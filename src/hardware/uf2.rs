@@ -242,7 +242,6 @@ pub async fn wait_for_serial_port(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
