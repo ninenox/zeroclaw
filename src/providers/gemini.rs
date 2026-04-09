@@ -893,8 +893,9 @@ impl GeminiProvider {
         let body = response.text().await?;
         tracing::trace!("loadCodeAssist raw response: {body}");
 
-        let json: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| anyhow::anyhow!("loadCodeAssist response parse error: {e}; body={body}"))?;
+        let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+            anyhow::anyhow!("loadCodeAssist response parse error: {e}; body={body}")
+        })?;
 
         // Extract project string from a JSON value that may be a plain string
         // or an object with a "projectId" key (API format changed ~Apr 2026).
@@ -918,9 +919,7 @@ impl GeminiProvider {
             })
             .or(project_seed)
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "loadCodeAssist response missing project context; body={body}"
-                )
+                anyhow::anyhow!("loadCodeAssist response missing project context; body={body}")
             })?;
 
         // Cache for future calls
