@@ -10639,6 +10639,41 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    #[test]
+    fn collect_configured_channels_includes_line_when_enabled() {
+        let mut config = Config::default();
+        config.channels_config.line = Some(crate::config::schema::LineConfig {
+            enabled: true,
+            channel_access_token: "test-token".to_string(),
+            channel_secret: "test-secret".to_string(),
+            allowed_users: vec!["*".to_string()],
+            webhook_port: 8443,
+            proxy_url: None,
+        });
+
+        let channels = collect_configured_channels(&config, "test");
+
+        assert!(channels.iter().any(|e| e.display_name == "LINE"));
+        assert!(channels.iter().any(|e| e.channel.name() == "line"));
+    }
+
+    #[test]
+    fn collect_configured_channels_excludes_line_when_disabled() {
+        let mut config = Config::default();
+        config.channels_config.line = Some(crate::config::schema::LineConfig {
+            enabled: false,
+            channel_access_token: "test-token".to_string(),
+            channel_secret: "test-secret".to_string(),
+            allowed_users: vec![],
+            webhook_port: 8443,
+            proxy_url: None,
+        });
+
+        let channels = collect_configured_channels(&config, "test");
+
+        assert!(!channels.iter().any(|e| e.display_name == "LINE"));
+    }
+
     struct AlwaysFailChannel {
         name: &'static str,
         calls: Arc<AtomicUsize>,
@@ -11720,6 +11755,35 @@ This is an example JSON object for profile settings."#;
         match build_channel_by_id(&config, "telegram") {
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
             Err(e) => panic!("should succeed when telegram is configured: {e}"),
+        }
+    }
+
+    #[test]
+    fn build_channel_by_id_unconfigured_line_returns_error() {
+        let config = Config::default();
+        match build_channel_by_id(&config, "line") {
+            Err(e) => assert!(
+                e.to_string().contains("not configured"),
+                "expected 'not configured' in error, got: {e}"
+            ),
+            Ok(_) => panic!("should fail when LINE is not configured"),
+        }
+    }
+
+    #[test]
+    fn build_channel_by_id_configured_line_succeeds() {
+        let mut config = Config::default();
+        config.channels_config.line = Some(crate::config::schema::LineConfig {
+            enabled: true,
+            channel_access_token: "test-token".to_string(),
+            channel_secret: "test-secret".to_string(),
+            allowed_users: vec![],
+            webhook_port: 8443,
+            proxy_url: None,
+        });
+        match build_channel_by_id(&config, "line") {
+            Ok(channel) => assert_eq!(channel.name(), "line"),
+            Err(e) => panic!("should succeed when LINE is configured: {e}"),
         }
     }
 
