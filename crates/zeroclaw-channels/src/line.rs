@@ -54,6 +54,8 @@ pub struct LineChannel {
     /// Populated by `listen()`, consumed once by `send()`.
     pending_tokens: Arc<RwLock<HashMap<String, String>>>,
     client: reqwest::Client,
+    /// Base URL for the LINE Messaging API. Overrideable in tests.
+    api_base_url: String,
 }
 
 /// Response from `GET /v2/bot/info`.
@@ -64,6 +66,271 @@ struct BotInfo {
     #[serde(rename = "displayName")]
     display_name: String,
 }
+
+// ---------------------------------------------------------------------------
+// Webhook state and router (module-level for testability)
+// ---------------------------------------------------------------------------
+
+struct LineState {
+    tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+    channel_secret: String,
+    bot_user_id: String,
+    dm_policy: LineDmPolicy,
+    group_policy: LineGroupPolicy,
+    allowed_users: Arc<RwLock<Vec<String>>>,
+    pairing: Option<Arc<PairingGuard>>,
+    pending_tokens: Arc<RwLock<HashMap<String, String>>>,
+}
+
+fn build_webhook_router(state: Arc<LineState>) -> axum::Router {
+    use axum::{routing::post, Router};
+    Router::new()
+        .route("/line/webhook", post(handle_webhook))
+        .with_state(state)
+}
+
+async fn handle_webhook(
+    axum::extract::State(state): axum::extract::State<Arc<LineState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::http::StatusCode {
+    use axum::http::StatusCode;
+
+    // 1. Verify LINE signature
+    let sig = headers
+        .get("x-line-signature")
+        .and_then(|v| v.to_str().ok());
+
+    let sig_valid = {
+        let Ok(mut mac) = HmacSha256::new_from_slice(state.channel_secret.as_bytes()) else {
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        };
+        mac.update(&body);
+        if let Some(s) = sig {
+            BASE64
+                .decode(s.trim())
+                .map(|decoded| mac.verify_slice(&decoded).is_ok())
+                .unwrap_or(false)
+        } else {
+            false
+        }
+    };
+
+    if !sig_valid {
+        tracing::warn!("LINE: rejected request with invalid signature");
+        return StatusCode::UNAUTHORIZED;
+    }
+
+    // 2. Parse payload
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("LINE: invalid JSON payload: {e}");
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+
+    let events = match payload.get("events").and_then(|e| e.as_array()) {
+        Some(ev) => ev.clone(),
+        None => return StatusCode::OK,
+    };
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    for event in &events {
+        // Only handle text message events
+        if event.get("type").and_then(|t| t.as_str()) != Some("message") {
+            continue;
+        }
+        let msg_obj = match event.get("message") {
+            Some(m) => m,
+            None => continue,
+        };
+        if msg_obj.get("type").and_then(|t| t.as_str()) != Some("text") {
+            continue;
+        }
+        let text = match msg_obj.get("text").and_then(|t| t.as_str()) {
+            Some(t) if !t.trim().is_empty() => t,
+            _ => continue,
+        };
+
+        let source = match event.get("source") {
+            Some(s) => s,
+            None => continue,
+        };
+        let source_type = source.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let user_id = match source.get("userId").and_then(|u| u.as_str()) {
+            Some(id) => id,
+            None => continue,
+        };
+
+        let is_group = matches!(source_type, "group" | "room");
+
+        // 3. Group policy gate
+        if is_group {
+            match state.group_policy {
+                LineGroupPolicy::Disabled => continue,
+                LineGroupPolicy::Open => {}
+                LineGroupPolicy::Mention => {
+                    let mention_span =
+                        LineChannel::find_bot_mention(msg_obj, &state.bot_user_id);
+                    if mention_span.is_none() {
+                        tracing::debug!(
+                            "LINE: skipping group message without bot mention (userId: {})",
+                            state.bot_user_id
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // 4. DM policy gate (non-group messages only)
+        if !is_group {
+            match state.dm_policy {
+                LineDmPolicy::Open => {}
+                LineDmPolicy::Allowlist => {
+                    let allowed = state
+                        .allowed_users
+                        .read()
+                        .iter()
+                        .any(|u| u == "*" || u == user_id);
+                    if !allowed {
+                        tracing::warn!(
+                            "LINE: ignoring DM from unauthorized user: {user_id}. \
+                            Add to channels.line.allowed_users or use dm_policy = pairing."
+                        );
+                        continue;
+                    }
+                }
+                LineDmPolicy::Pairing => {
+                    let already_allowed = state
+                        .allowed_users
+                        .read()
+                        .iter()
+                        .any(|u| u == "*" || u == user_id);
+
+                    if !already_allowed {
+                        // Try pairing bind
+                        if let Some(code) = LineChannel::extract_bind_code(text) {
+                            if let Some(ref guard) = state.pairing {
+                                match guard.try_pair(code, user_id).await {
+                                    Ok(Some(_)) => {
+                                        state
+                                            .allowed_users
+                                            .write()
+                                            .push(user_id.to_string());
+                                        tracing::info!("LINE: paired userId={user_id}");
+                                        // Send confirmation via Push API (no reply token yet)
+                                        // We forward a synthetic message to let the agent greet
+                                    }
+                                    Ok(None) => {
+                                        tracing::warn!(
+                                            "LINE: invalid bind code from userId={user_id}"
+                                        );
+                                    }
+                                    Err(wait_ms) => {
+                                        tracing::warn!(
+                                            "LINE: bind rate-limited for userId={user_id}, retry after {wait_ms}ms"
+                                        );
+                                    }
+                                }
+                            }
+                            continue; // bind commands are not forwarded to agent
+                        }
+
+                        tracing::warn!(
+                            "LINE: ignoring message from unpaired user: {user_id}. \
+                            Send `{LINE_BIND_COMMAND} <code>` to pair."
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // 5. Mention gate for group messages using `mention` policy
+        let mention_span = if is_group && state.group_policy == LineGroupPolicy::Mention {
+            LineChannel::find_bot_mention(msg_obj, &state.bot_user_id)
+        } else {
+            None
+        };
+
+        // 6. Resolve recipient (groupId/roomId for group context)
+        let recipient = match source_type {
+            "group" => source
+                .get("groupId")
+                .and_then(|v| v.as_str())
+                .unwrap_or(user_id)
+                .to_string(),
+            "room" => source
+                .get("roomId")
+                .and_then(|v| v.as_str())
+                .unwrap_or(user_id)
+                .to_string(),
+            _ => user_id.to_string(),
+        };
+
+        // 7. Strip the @mention span from group messages using char index/length.
+        let content = if let Some((idx, len)) = mention_span {
+            let stripped = LineChannel::strip_mention_range(text, idx, len);
+            if stripped.is_empty() {
+                continue;
+            }
+            stripped
+        } else {
+            text.trim().to_string()
+        };
+
+        if content.is_empty() {
+            continue;
+        }
+
+        // 8. Cache reply token
+        if let Some(token) = event
+            .get("replyToken")
+            .and_then(|t| t.as_str())
+            .filter(|t| !t.is_empty())
+        {
+            state
+                .pending_tokens
+                .write()
+                .insert(recipient.clone(), token.to_string());
+        }
+
+        let msg_id = msg_obj
+            .get("id")
+            .and_then(|i| i.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        let channel_msg = ChannelMessage {
+            id: msg_id,
+            sender: user_id.to_string(),
+            reply_target: recipient,
+            content,
+            channel: "line".to_string(),
+            timestamp,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+
+        if state.tx.send(channel_msg).await.is_err() {
+            tracing::warn!("LINE: receiver dropped, shutting down webhook server");
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
+    }
+
+    StatusCode::OK
+}
+
+// ---------------------------------------------------------------------------
+// LineChannel implementation
+// ---------------------------------------------------------------------------
 
 impl LineChannel {
     /// Create a new `LineChannel`.
@@ -111,6 +378,7 @@ impl LineChannel {
             webhook_port,
             pending_tokens: Arc::new(RwLock::new(HashMap::new())),
             client: zeroclaw_config::schema::build_channel_proxy_client("channel.line", None),
+            api_base_url: "https://api.line.me".to_string(),
         }
     }
 
@@ -120,6 +388,13 @@ impl LineChannel {
             "channel.line",
             proxy_url.as_deref(),
         );
+        self
+    }
+
+    /// Override the LINE API base URL. Intended for tests.
+    #[cfg(test)]
+    pub(crate) fn with_api_base_url(mut self, url: &str) -> Self {
+        self.api_base_url = url.trim_end_matches('/').to_string();
         self
     }
 
@@ -150,9 +425,10 @@ impl LineChannel {
 
     /// Fetch bot info from LINE API. Returns `(userId, displayName)`.
     async fn fetch_bot_info(&self) -> anyhow::Result<BotInfo> {
+        let url = format!("{}/v2/bot/info", self.api_base_url);
         let resp = self
             .client
-            .get("https://api.line.me/v2/bot/info")
+            .get(&url)
             .bearer_auth(&self.channel_access_token)
             .send()
             .await?;
@@ -287,6 +563,7 @@ impl LineChannel {
 
     /// Send text via the Reply API (consumes `reply_token`).
     async fn send_reply(&self, reply_token: &str, text: &str) -> anyhow::Result<()> {
+        let url = format!("{}/v2/bot/message/reply", self.api_base_url);
         let messages: Vec<serde_json::Value> = Self::split_message(text)
             .into_iter()
             .map(|chunk| serde_json::json!({"type": "text", "text": chunk}))
@@ -300,7 +577,7 @@ impl LineChannel {
             });
             let resp = self
                 .client
-                .post("https://api.line.me/v2/bot/message/reply")
+                .post(&url)
                 .bearer_auth(&self.channel_access_token)
                 .json(&body)
                 .send()
@@ -317,6 +594,7 @@ impl LineChannel {
 
     /// Send text via the Push API (requires a paid LINE plan for high volume).
     async fn send_push(&self, to: &str, text: &str) -> anyhow::Result<()> {
+        let url = format!("{}/v2/bot/message/push", self.api_base_url);
         let messages: Vec<serde_json::Value> = Self::split_message(text)
             .into_iter()
             .map(|chunk| serde_json::json!({"type": "text", "text": chunk}))
@@ -329,7 +607,7 @@ impl LineChannel {
             });
             let resp = self
                 .client
-                .post("https://api.line.me/v2/bot/message/push")
+                .post(&url)
                 .bearer_auth(&self.channel_access_token)
                 .json(&body)
                 .send()
@@ -342,6 +620,34 @@ impl LineChannel {
             }
         }
         Ok(())
+    }
+
+    /// Start serving the webhook on an already-bound `TcpListener`.
+    ///
+    /// `bot_user_id` is used for native mention detection. The public `listen()`
+    /// fetches it automatically from `GET /v2/bot/info`; tests can supply it
+    /// directly to avoid a real network call.
+    pub(crate) async fn listen_with_listener(
+        &self,
+        listener: tokio::net::TcpListener,
+        bot_user_id: String,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        let state = Arc::new(LineState {
+            tx,
+            channel_secret: self.channel_secret.clone(),
+            bot_user_id,
+            dm_policy: self.dm_policy.clone(),
+            group_policy: self.group_policy.clone(),
+            allowed_users: Arc::clone(&self.allowed_users),
+            pairing: self.pairing.clone(),
+            pending_tokens: Arc::clone(&self.pending_tokens),
+        });
+
+        let app = build_webhook_router(state);
+        axum::serve(listener, app)
+            .await
+            .map_err(|e| anyhow::anyhow!("LINE webhook server error: {e}"))
     }
 }
 
@@ -380,285 +686,12 @@ impl Channel for LineChannel {
     /// before starting the server. The `userId` is used for native mention detection
     /// via `message.mention.mentionees`.
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        use axum::{
-            Router,
-            body::Bytes,
-            extract::State,
-            http::{HeaderMap, StatusCode},
-            routing::post,
-        };
-
-        // Fetch bot identity once at startup.
         let bot_info = self.fetch_bot_info().await?;
         tracing::info!(
             "LINE: connected as '{}' (userId: {})",
             bot_info.display_name,
             bot_info.user_id
         );
-
-        struct LineState {
-            tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-            channel_secret: String,
-            bot_user_id: String,
-            dm_policy: LineDmPolicy,
-            group_policy: LineGroupPolicy,
-            allowed_users: Arc<RwLock<Vec<String>>>,
-            pairing: Option<Arc<PairingGuard>>,
-            pending_tokens: Arc<RwLock<HashMap<String, String>>>,
-        }
-
-        let state = Arc::new(LineState {
-            tx,
-            channel_secret: self.channel_secret.clone(),
-            bot_user_id: bot_info.user_id,
-            dm_policy: self.dm_policy.clone(),
-            group_policy: self.group_policy.clone(),
-            allowed_users: Arc::clone(&self.allowed_users),
-            pairing: self.pairing.clone(),
-            pending_tokens: Arc::clone(&self.pending_tokens),
-        });
-
-        async fn handle_webhook(
-            State(state): State<Arc<LineState>>,
-            headers: HeaderMap,
-            body: Bytes,
-        ) -> StatusCode {
-            // 1. Verify LINE signature
-            let sig = headers
-                .get("x-line-signature")
-                .and_then(|v| v.to_str().ok());
-
-            let sig_valid = {
-                let Ok(mut mac) = HmacSha256::new_from_slice(state.channel_secret.as_bytes())
-                else {
-                    return StatusCode::INTERNAL_SERVER_ERROR;
-                };
-                mac.update(&body);
-                if let Some(s) = sig {
-                    BASE64
-                        .decode(s.trim())
-                        .map(|decoded| mac.verify_slice(&decoded).is_ok())
-                        .unwrap_or(false)
-                } else {
-                    false
-                }
-            };
-
-            if !sig_valid {
-                tracing::warn!("LINE: rejected request with invalid signature");
-                return StatusCode::UNAUTHORIZED;
-            }
-
-            // 2. Parse payload
-            let payload: serde_json::Value = match serde_json::from_slice(&body) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!("LINE: invalid JSON payload: {e}");
-                    return StatusCode::BAD_REQUEST;
-                }
-            };
-
-            let events = match payload.get("events").and_then(|e| e.as_array()) {
-                Some(ev) => ev.clone(),
-                None => return StatusCode::OK,
-            };
-
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            for event in &events {
-                // Only handle text message events
-                if event.get("type").and_then(|t| t.as_str()) != Some("message") {
-                    continue;
-                }
-                let msg_obj = match event.get("message") {
-                    Some(m) => m,
-                    None => continue,
-                };
-                if msg_obj.get("type").and_then(|t| t.as_str()) != Some("text") {
-                    continue;
-                }
-                let text = match msg_obj.get("text").and_then(|t| t.as_str()) {
-                    Some(t) if !t.trim().is_empty() => t,
-                    _ => continue,
-                };
-
-                let source = match event.get("source") {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let source_type = source.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                let user_id = match source.get("userId").and_then(|u| u.as_str()) {
-                    Some(id) => id,
-                    None => continue,
-                };
-
-                let is_group = matches!(source_type, "group" | "room");
-
-                // 3. Group policy gate
-                if is_group {
-                    match state.group_policy {
-                        LineGroupPolicy::Disabled => continue,
-                        LineGroupPolicy::Open => {}
-                        LineGroupPolicy::Mention => {
-                            let mention_span =
-                                LineChannel::find_bot_mention(msg_obj, &state.bot_user_id);
-                            if mention_span.is_none() {
-                                tracing::debug!(
-                                    "LINE: skipping group message without bot mention (userId: {})",
-                                    state.bot_user_id
-                                );
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                // 4. DM policy gate (non-group messages only)
-                if !is_group {
-                    match state.dm_policy {
-                        LineDmPolicy::Open => {}
-                        LineDmPolicy::Allowlist => {
-                            let allowed = state
-                                .allowed_users
-                                .read()
-                                .iter()
-                                .any(|u| u == "*" || u == user_id);
-                            if !allowed {
-                                tracing::warn!(
-                                    "LINE: ignoring DM from unauthorized user: {user_id}. \
-                                    Add to channels.line.allowed_users or use dm_policy = pairing."
-                                );
-                                continue;
-                            }
-                        }
-                        LineDmPolicy::Pairing => {
-                            let already_allowed = state
-                                .allowed_users
-                                .read()
-                                .iter()
-                                .any(|u| u == "*" || u == user_id);
-
-                            if !already_allowed {
-                                // Try pairing bind
-                                if let Some(code) = LineChannel::extract_bind_code(text) {
-                                    if let Some(ref guard) = state.pairing {
-                                        match guard.try_pair(code, user_id).await {
-                                            Ok(Some(_)) => {
-                                                state
-                                                    .allowed_users
-                                                    .write()
-                                                    .push(user_id.to_string());
-                                                tracing::info!("LINE: paired userId={user_id}");
-                                                // Send confirmation via Push API (no reply token yet)
-                                                // We forward a synthetic message to let the agent greet
-                                            }
-                                            Ok(None) => {
-                                                tracing::warn!(
-                                                    "LINE: invalid bind code from userId={user_id}"
-                                                );
-                                            }
-                                            Err(wait_ms) => {
-                                                tracing::warn!(
-                                                    "LINE: bind rate-limited for userId={user_id}, retry after {wait_ms}ms"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    continue; // bind commands are not forwarded to agent
-                                }
-
-                                tracing::warn!(
-                                    "LINE: ignoring message from unpaired user: {user_id}. \
-                                    Send `{LINE_BIND_COMMAND} <code>` to pair."
-                                );
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                // 5. Mention gate for group messages using `mention` policy
-                let mention_span = if is_group && state.group_policy == LineGroupPolicy::Mention {
-                    LineChannel::find_bot_mention(msg_obj, &state.bot_user_id)
-                } else {
-                    None
-                };
-
-                // 6. Resolve recipient (groupId/roomId for group context)
-                let recipient = match source_type {
-                    "group" => source
-                        .get("groupId")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(user_id)
-                        .to_string(),
-                    "room" => source
-                        .get("roomId")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(user_id)
-                        .to_string(),
-                    _ => user_id.to_string(),
-                };
-
-                // 7. Strip the @mention span from group messages using char index/length.
-                let content = if let Some((idx, len)) = mention_span {
-                    let stripped = LineChannel::strip_mention_range(text, idx, len);
-                    if stripped.is_empty() {
-                        continue;
-                    }
-                    stripped
-                } else {
-                    text.trim().to_string()
-                };
-
-                if content.is_empty() {
-                    continue;
-                }
-
-                // 8. Cache reply token
-                if let Some(token) = event
-                    .get("replyToken")
-                    .and_then(|t| t.as_str())
-                    .filter(|t| !t.is_empty())
-                {
-                    state
-                        .pending_tokens
-                        .write()
-                        .insert(recipient.clone(), token.to_string());
-                }
-
-                let msg_id = msg_obj
-                    .get("id")
-                    .and_then(|i| i.as_str())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| Uuid::new_v4().to_string());
-
-                let channel_msg = ChannelMessage {
-                    id: msg_id,
-                    sender: user_id.to_string(),
-                    reply_target: recipient,
-                    content,
-                    channel: "line".to_string(),
-                    timestamp,
-                    thread_ts: None,
-                    interruption_scope_id: None,
-                    attachments: vec![],
-                };
-
-                if state.tx.send(channel_msg).await.is_err() {
-                    tracing::warn!("LINE: receiver dropped, shutting down webhook server");
-                    return StatusCode::SERVICE_UNAVAILABLE;
-                }
-            }
-
-            StatusCode::OK
-        }
-
-        let app = Router::new()
-            .route("/line/webhook", post(handle_webhook))
-            .with_state(state);
 
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], self.webhook_port));
         tracing::info!(
@@ -667,17 +700,14 @@ impl Channel for LineChannel {
         );
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app)
-            .await
-            .map_err(|e| anyhow::anyhow!("LINE webhook server error: {e}"))?;
-
-        Ok(())
+        self.listen_with_listener(listener, bot_info.user_id, tx).await
     }
 
     async fn health_check(&self) -> bool {
+        let url = format!("{}/v2/bot/info", self.api_base_url);
         let resp = self
             .client
-            .get("https://api.line.me/v2/bot/info")
+            .get(&url)
             .bearer_auth(&self.channel_access_token)
             .send()
             .await;
@@ -685,9 +715,16 @@ impl Channel for LineChannel {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
+
+    // ---- Helpers -----------------------------------------------------------
 
     fn make_channel() -> LineChannel {
         LineChannel::new(
@@ -699,6 +736,127 @@ mod tests {
             8444,
         )
     }
+
+    /// Compute a valid `X-Line-Signature` for `body` signed with `secret`.
+    fn sign(secret: &str, body: &[u8]) -> String {
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        BASE64.encode(mac.finalize().into_bytes())
+    }
+
+    /// Build a standard DM text event payload.
+    fn dm_event(user_id: &str, text: &str, reply_token: &str) -> serde_json::Value {
+        serde_json::json!({
+            "events": [{
+                "type": "message",
+                "replyToken": reply_token,
+                "source": {"type": "user", "userId": user_id},
+                "message": {"id": "msg001", "type": "text", "text": text}
+            }]
+        })
+    }
+
+    /// Build a group text event without a mention.
+    fn group_event(
+        user_id: &str,
+        group_id: &str,
+        text: &str,
+        reply_token: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "events": [{
+                "type": "message",
+                "replyToken": reply_token,
+                "source": {"type": "group", "groupId": group_id, "userId": user_id},
+                "message": {"id": "msg002", "type": "text", "text": text}
+            }]
+        })
+    }
+
+    /// Build a group text event with a bot mention at `(index, length)`.
+    fn group_mention_event(
+        user_id: &str,
+        group_id: &str,
+        text: &str,
+        bot_id: &str,
+        mention_index: u64,
+        mention_length: u64,
+        reply_token: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "events": [{
+                "type": "message",
+                "replyToken": reply_token,
+                "source": {"type": "group", "groupId": group_id, "userId": user_id},
+                "message": {
+                    "id": "msg003",
+                    "type": "text",
+                    "text": text,
+                    "mention": {
+                        "mentionees": [{
+                            "index": mention_index,
+                            "length": mention_length,
+                            "userId": bot_id,
+                            "type": "user"
+                        }]
+                    }
+                }
+            }]
+        })
+    }
+
+    /// POST a signed webhook payload; returns the HTTP status code.
+    async fn post_signed(port: u16, secret: &str, body: &serde_json::Value) -> u16 {
+        let bytes = serde_json::to_vec(body).unwrap();
+        let sig = sign(secret, &bytes);
+        reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/line/webhook"))
+            .header("Content-Type", "application/json")
+            .header("X-Line-Signature", sig)
+            .body(bytes)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    /// POST a webhook payload with an invalid signature.
+    async fn post_bad_sig(port: u16, body: &serde_json::Value) -> u16 {
+        let bytes = serde_json::to_vec(body).unwrap();
+        reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/line/webhook"))
+            .header("Content-Type", "application/json")
+            .header("X-Line-Signature", "badsig==")
+            .body(bytes)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    /// Spawn a webhook server on an OS-assigned port.
+    /// Returns `(port, rx)`. Drop the `JoinHandle` to stop the server.
+    async fn spawn_webhook(
+        ch: LineChannel,
+        bot_user_id: &str,
+    ) -> (u16, mpsc::Receiver<ChannelMessage>, tokio::task::AbortHandle) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel(16);
+        let bot_id = bot_user_id.to_string();
+        let jh = tokio::spawn(async move {
+            ch.listen_with_listener(listener, bot_id, tx).await.ok();
+        });
+        // Give the server a moment to begin accepting connections.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        (port, rx, jh.abort_handle())
+    }
+
+    // ---- Existing unit tests -----------------------------------------------
 
     #[test]
     fn name_is_line() {
@@ -902,5 +1060,526 @@ mod tests {
             "userId": "U123"
         });
         assert_eq!(LineChannel::resolve_recipient(&source).unwrap(), "Rabc");
+    }
+
+    // ---- API integration tests (wiremock) ----------------------------------
+
+    #[tokio::test]
+    async fn health_check_returns_true_on_200() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/bot/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "userId": "Ubot", "displayName": "TestBot"
+            })))
+            .mount(&server)
+            .await;
+
+        let ch = LineChannel::new(
+            "tok".into(),
+            "sec".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            vec![],
+            8444,
+        )
+        .with_api_base_url(&server.uri());
+
+        assert!(ch.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn health_check_returns_false_on_401() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/bot/info"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let ch = LineChannel::new(
+            "bad-tok".into(),
+            "sec".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            vec![],
+            8444,
+        )
+        .with_api_base_url(&server.uri());
+
+        assert!(!ch.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn send_uses_reply_api_when_token_available() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/bot/message/reply"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ch = LineChannel::new(
+            "tok".into(),
+            "sec".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            vec![],
+            8444,
+        )
+        .with_api_base_url(&server.uri());
+
+        ch.pending_tokens
+            .write()
+            .insert("Urecipient".to_string(), "reply-token-123".to_string());
+
+        ch.send(&SendMessage::new("hello", "Urecipient"))
+            .await
+            .unwrap();
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn send_falls_back_to_push_when_no_token() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/bot/message/push"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ch = LineChannel::new(
+            "tok".into(),
+            "sec".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            vec![],
+            8444,
+        )
+        .with_api_base_url(&server.uri());
+
+        // No pending token seeded — must use Push API.
+        ch.send(&SendMessage::new("hello", "Urecipient"))
+            .await
+            .unwrap();
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn send_falls_back_to_push_when_reply_api_fails() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Reply API returns 400 (e.g. token expired)
+        Mock::given(method("POST"))
+            .and(path("/v2/bot/message/reply"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "message": "Invalid reply token"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Push API succeeds
+        Mock::given(method("POST"))
+            .and(path("/v2/bot/message/push"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ch = LineChannel::new(
+            "tok".into(),
+            "sec".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            vec![],
+            8444,
+        )
+        .with_api_base_url(&server.uri());
+
+        ch.pending_tokens
+            .write()
+            .insert("Urecipient".to_string(), "expired-token".to_string());
+
+        ch.send(&SendMessage::new("hello", "Urecipient"))
+            .await
+            .unwrap();
+
+        server.verify().await;
+    }
+
+    // ---- Webhook integration tests (live axum server + reqwest) ------------
+
+    #[tokio::test]
+    async fn webhook_rejects_bad_signature() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            vec![],
+            0,
+        );
+        let (port, _rx, abort) = spawn_webhook(ch, "Ubot").await;
+        let status = post_bad_sig(port, &dm_event("Uuser", "hello", "rt1")).await;
+        assert_eq!(status, 401);
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_dm_open_forwards_message() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            vec![],
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        let status = post_signed(port, "mysecret", &dm_event("Uuser1", "hi there", "rt1")).await;
+        assert_eq!(status, 200);
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for message")
+            .expect("channel closed");
+
+        assert_eq!(msg.content, "hi there");
+        assert_eq!(msg.sender, "Uuser1");
+        assert_eq!(msg.channel, "line");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_reply_token_is_cached() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            vec![],
+            0,
+        );
+        let tokens = Arc::clone(&ch.pending_tokens);
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(port, "mysecret", &dm_event("Uuser", "ping", "reply-tok-abc")).await;
+        let _ = rx.recv().await;
+
+        assert_eq!(
+            tokens.read().get("Uuser").map(String::as_str),
+            Some("reply-tok-abc")
+        );
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_dm_allowlist_blocks_unknown_user() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Allowlist,
+            LineGroupPolicy::Open,
+            vec!["Uallowed".to_string()],
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        // Unknown user — must be blocked
+        let status =
+            post_signed(port, "mysecret", &dm_event("Ustranger", "hello", "rt1")).await;
+        assert_eq!(status, 200); // HTTP still 200; message is silently dropped
+
+        // Verify nothing arrived in rx within a short window
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(result.is_err(), "blocked user should not produce a message");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_dm_allowlist_allows_known_user() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Allowlist,
+            LineGroupPolicy::Open,
+            vec!["Uallowed".to_string()],
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        let status =
+            post_signed(port, "mysecret", &dm_event("Uallowed", "secret", "rt2")).await;
+        assert_eq!(status, 200);
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg.content, "secret");
+        assert_eq!(msg.sender, "Uallowed");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_dm_pairing_rejects_unpaired_user() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Pairing,
+            LineGroupPolicy::Open,
+            vec![],
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        // Plain message from unpaired user
+        post_signed(port, "mysecret", &dm_event("Unew", "hi bot", "rt1")).await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(result.is_err(), "unpaired user message must be dropped");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_dm_pairing_bind_command_is_not_forwarded() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Pairing,
+            LineGroupPolicy::Open,
+            vec![],
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        // /bind command must be consumed, not forwarded to agent
+        post_signed(
+            port,
+            "mysecret",
+            &dm_event("Unew", "/bind wrongcode", "rt1"),
+        )
+        .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(result.is_err(), "/bind command must not reach agent");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_dm_pairing_allows_pre_seeded_user() {
+        // If dm_policy=Pairing but a user is already in allowed_users,
+        // they should be forwarded without needing to /bind again.
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Pairing,
+            LineGroupPolicy::Open,
+            vec!["Utrusted".to_string()],
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(port, "mysecret", &dm_event("Utrusted", "hey", "rt1")).await;
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg.content, "hey");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_group_disabled_ignores_all_messages() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Disabled,
+            vec![],
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &group_event("Uuser", "Ggroup1", "hello group", "rt1"),
+        )
+        .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(result.is_err(), "group message must be dropped when policy=disabled");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_group_open_forwards_any_message() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            vec![],
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &group_event("Uuser", "Ggroup1", "anyone home?", "rt1"),
+        )
+        .await;
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg.content, "anyone home?");
+        assert_eq!(msg.reply_target, "Ggroup1");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_group_mention_skips_message_without_mention() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Mention,
+            vec![],
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot123").await;
+
+        // No mention in this group message
+        post_signed(
+            port,
+            "mysecret",
+            &group_event("Uuser", "Ggrp", "hey everyone", "rt1"),
+        )
+        .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(result.is_err(), "group message without mention must be dropped");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_group_mention_forwards_message_with_mention() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Mention,
+            vec![],
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot123").await;
+
+        // "@Bot help me" — @Bot is 4 chars at index 0
+        let payload = group_mention_event("Uuser", "Ggrp", "@Bot help me", "Ubot123", 0, 4, "rt1");
+        post_signed(port, "mysecret", &payload).await;
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // Mention span stripped: "@Bot " removed, leaving "help me"
+        assert_eq!(msg.content, "help me");
+        assert_eq!(msg.reply_target, "Ggrp");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_ignores_non_message_events() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            vec![],
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        let follow_event = serde_json::json!({
+            "events": [{
+                "type": "follow",
+                "source": {"type": "user", "userId": "Uuser"}
+            }]
+        });
+        let status = post_signed(port, "mysecret", &follow_event).await;
+        assert_eq!(status, 200);
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(result.is_err(), "non-message events must be ignored");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_ignores_non_text_messages() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            vec![],
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        let image_event = serde_json::json!({
+            "events": [{
+                "type": "message",
+                "replyToken": "rt1",
+                "source": {"type": "user", "userId": "Uuser"},
+                "message": {"id": "img001", "type": "image"}
+            }]
+        });
+        post_signed(port, "mysecret", &image_event).await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(result.is_err(), "image messages must be ignored");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_empty_events_array_returns_200() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            vec![],
+            0,
+        );
+        let (port, _rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        let status =
+            post_signed(port, "mysecret", &serde_json::json!({"events": []})).await;
+        assert_eq!(status, 200);
+        abort.abort();
     }
 }
